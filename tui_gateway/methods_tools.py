@@ -1336,11 +1336,41 @@ def _(rid, params: dict) -> dict:
 
 @_mcp_rpc("oauth.callback", _NAME_SESSION)
 def _(rid, params: dict) -> dict:
-    """Relay a client-captured redirect (``code``/``state``/``error``) into a ``client_redirect_uri`` flow."""
-    code, state, error = (str(params.get(k) or "") or None for k in ("code", "state", "error"))
-    deliver = _tools_mod("tui_gateway.mcp_oauth_sessions").deliver_callback_flow
-    return _ok(rid, deliver(
-        _str_arg(params, "session_id"), _str_arg(params, "name"), code=code, state=state, error=error))
+    """Relay a client-captured OAuth redirect into a running MCP OAuth flow.
+
+    Remote-backend companion to ``mcp.servers.oauth.start`` with
+    ``client_redirect_uri``: the desktop app's local loopback listener caught
+    the provider redirect on the user's machine and forwards its query params
+    here. Params: optional ``profile``, ``name`` (required), ``session_id``
+    (required), ``code``, ``state``, ``error``. Result: ``{ok: true}`` once the
+    callback is accepted (state verified inside the flow bridge), or
+    ``{ok: false, error_message}`` on mismatch/expiry.
+    """
+    name = str(params.get("name") or "").strip()
+    if not name:
+        return _err(rid, 4063, "name required")
+    session_id = str(params.get("session_id") or "").strip()
+    if not session_id:
+        return _err(rid, 4063, "session_id required")
+    token, err = _mcp_resolve_profile(rid, params)
+    if err:
+        return err
+    try:
+        from tui_gateway import mcp_oauth_sessions
+
+        result = mcp_oauth_sessions.deliver_callback_flow(
+            session_id,
+            name,
+            code=str(params.get("code") or "") or None,
+            state=str(params.get("state") or "") or None,
+            error=str(params.get("error") or "") or None,
+            iss=str(params.get("iss") or "") or None,
+        )
+        return _ok(rid, result)
+    except Exception as e:
+        return _err(rid, 5024, str(e))
+    finally:
+        _mcp_reset_profile(token)
 
 
 # ─── Plugins ─────────────────────────────────────────────────────────────────

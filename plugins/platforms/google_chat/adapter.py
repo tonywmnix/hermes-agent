@@ -898,23 +898,42 @@ class GoogleChatAdapter(BasePlatformAdapter):
         if slash:
             message_type = MessageType.COMMAND
 
-        # PRE-increment count (persisted) drives the main-flow-vs-side-thread heuristic.
-        prev_thread_count = self._thread_count_store.incr(space_name, thread_name) if thread_name and space_name else 0
-        # DMs: prev_count == 0 → Chat auto-created this thread for a top-level message: share one
-        # DM session, reply top-level (thread.name would render an expandable thread); >= 1 → user
-        # engaged an existing thread: isolate + reply in-thread. Groups: always isolate + in-thread.
-        if chat_type == "dm":
-            is_side_thread = prev_thread_count > 0
-            session_thread_id = thread_name if is_side_thread else None
-            # Outbound cache only for side-threads so main-flow replies land top-level.
-            if thread_name and space_name and is_side_thread:
-                self._last_inbound_thread[space_name] = thread_name
-            elif space_name:
-                self._last_inbound_thread.pop(space_name, None)
-        else:
-            session_thread_id = thread_name
-            if thread_name and space_name:
-                self._last_inbound_thread[space_name] = thread_name
+        # Increment the persistent inbound count for this thread.
+        # The PRE-increment value (==0 for the very first time we see
+        # this thread, persisted across gateway restarts) drives the
+        # main-flow-vs-side-thread heuristic below.
+        prev_thread_count = 0
+        if thread_name and space_name:
+            prev_thread_count = self._thread_count_store.incr(
+                space_name, thread_name
+            )
+
+        # Session-thread + outbound-thread routing for DMs:
+        # - prev_count == 0  → first message in this thread. Google Chat
+        #   creates a fresh thread per top-level message in the DM input
+        #   box; treat as "main flow" so all top-level messages share
+        #   one DM session and the user keeps continuity. The bot's
+        #   reply ALSO must NOT thread with the user message — if we
+        #   pass thread.name on outbound, Chat displays the pair as an
+        #   expandable thread under the user's message instead of two
+        #   adjacent top-level cards.
+        # - prev_count >= 1  → user explicitly engaged a thread that
+        #   already had messages (clicked "Reply in thread" on a prior
+        #   message). Isolate session by chat_id+thread_id, AND keep
+        #   the bot's reply inside that thread.
+        #
+        # For groups, threads ARE meaningful conversational containers
+        # (Telegram forum / Discord thread parity); always isolate AND
+        # always reply in-thread.
+        #
+        # Tony (2026-09-03): wants DM replies to ALWAYS land in-thread,
+        # including the very first message of a freshly-auto-created
+        # thread (prev_count == 0). Dropped the DM main-flow/side-thread
+        # split; DMs now behave exactly like groups below.
+        session_thread_id = thread_name
+        if thread_name and space_name:
+            self._last_inbound_thread[space_name] = thread_name
+
         source = self.build_source(
             chat_id=space_name, chat_name=space.get("displayName") or space.get("name") or "", chat_type=chat_type,
             # Email is the canonical id (allowlists use emails); the ``users/{id}``

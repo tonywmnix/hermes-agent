@@ -27,7 +27,36 @@ def test_dashboard_flow_exposes_authorization_url_and_accepts_callback():
     }
 
     flow.deliver_callback(code="code-1", state="s1", error=None)
-    assert asyncio.run(flow.wait_for_callback()) == ("code-1", "s1")
+    assert asyncio.run(flow.wait_for_callback()) == ("code-1", "s1", None)
+
+
+def test_dashboard_flow_callback_preserves_rfc9207_iss():
+    """RFC 9207 `iss` must survive deliver_callback -> wait_for_callback.
+
+    Regression test for the "Authorization response missing iss parameter
+    advertised by the authorization server" OAuthFlowError: the dashboard
+    callback route used to only carry (code, state) through the flow,
+    silently dropping `iss` even when the authorization server advertised
+    authorization_response_iss_parameter_supported and sent it.
+    """
+    from tools.mcp_dashboard_oauth import DashboardOAuthFlow
+
+    flow = DashboardOAuthFlow(
+        flow_id="flow-iss",
+        server_name="reports",
+        profile=None,
+        hermes_home="/tmp/hermes-test",
+        redirect_uri="https://agent.example/mcp/oauth/callback/flow-iss",
+    )
+    asyncio.run(flow.publish_authorization_url("https://idp.example/authorize?state=s-iss"))
+    flow.deliver_callback(
+        code="code-iss", state="s-iss", error=None, iss="https://idp.example"
+    )
+    assert asyncio.run(flow.wait_for_callback()) == (
+        "code-iss",
+        "s-iss",
+        "https://idp.example",
+    )
 
 
 def test_dashboard_flow_accepts_only_one_concurrent_callback():
