@@ -1111,6 +1111,10 @@ export const api = {
   authMcpServer: (name: string) =>
     fetchJSON<McpOAuthFlow>(`/api/mcp/servers/${encodeURIComponent(name)}/auth`, { method: 'POST' }),
   getMcpOAuthFlow: (flowId: string) => fetchJSON<McpOAuthFlow>(`/api/mcp/oauth/flows/${encodeURIComponent(flowId)}`),
+  cancelMcpOAuthFlow: (flowId: string) =>
+    fetchJSON<{ ok: boolean; status: string }>(`/api/mcp/oauth/flows/${encodeURIComponent(flowId)}`, {
+      method: 'DELETE'
+    }),
   removeMcpServer: (name: string) =>
     fetchJSON<{ ok: boolean }>(`/api/mcp/servers/${encodeURIComponent(name)}`, {
       method: 'DELETE'

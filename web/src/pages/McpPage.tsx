@@ -188,6 +188,7 @@ export default function McpPage() {
         serverName: server.name,
         start: api.authMcpServer,
         status: api.getMcpOAuthFlow,
+        cancel: api.cancelMcpOAuthFlow,
         open: window.open.bind(window),
       });
       setTestResults((prev) => ({

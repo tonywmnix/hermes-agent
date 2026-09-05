@@ -112,6 +112,96 @@ describe("completeMcpDashboardOAuth", () => {
     ).rejects.toThrow("authorization window was closed");
   });
 
+  it("cancels the abandoned flow server-side when the window closes early", async () => {
+    const authWindow = { location: { href: "" }, opener: {}, closed: false } as unknown as Window;
+    const status = vi.fn().mockImplementation(async () => {
+      Object.defineProperty(authWindow, "closed", { value: true });
+      return {
+        flow_id: "flow-closed",
+        server_name: "reports",
+        status: "authorization_required",
+        authorization_url: "https://idp.example/authorize",
+        error: null,
+      };
+    });
+    const cancel = vi.fn().mockResolvedValue({ ok: true, status: "error" });
+
+    await expect(
+      completeMcpDashboardOAuth({
+        serverName: "reports",
+        start: async () => ({
+          flow_id: "flow-closed",
+          server_name: "reports",
+          status: "authorization_required",
+          authorization_url: "https://idp.example/authorize",
+          error: null,
+        }),
+        status,
+        cancel,
+        open: vi.fn().mockReturnValue(authWindow),
+        sleep: async () => {},
+      }),
+    ).rejects.toThrow("authorization window was closed");
+    expect(cancel).toHaveBeenCalledWith("flow-closed");
+  });
+
+  it("cancels the abandoned flow server-side after repeated poll failures", async () => {
+    const authWindow = { location: { href: "" }, opener: {}, closed: false } as unknown as Window;
+    const status = vi.fn().mockRejectedValue(new Error("network down"));
+    const cancel = vi.fn().mockResolvedValue({ ok: true, status: "error" });
+
+    await expect(
+      completeMcpDashboardOAuth({
+        serverName: "reports",
+        start: async () => ({
+          flow_id: "flow-flaky",
+          server_name: "reports",
+          status: "authorization_required",
+          authorization_url: "https://idp.example/authorize",
+          error: null,
+        }),
+        status,
+        cancel,
+        maxPollFailures: 2,
+        open: vi.fn().mockReturnValue(authWindow),
+        sleep: async () => {},
+      }),
+    ).rejects.toThrow("network down");
+    expect(cancel).toHaveBeenCalledWith("flow-flaky");
+  });
+
+  it("swallows a cancel failure and still surfaces the original error", async () => {
+    const authWindow = { location: { href: "" }, opener: {}, closed: false } as unknown as Window;
+    const status = vi.fn().mockImplementation(async () => {
+      Object.defineProperty(authWindow, "closed", { value: true });
+      return {
+        flow_id: "flow-closed",
+        server_name: "reports",
+        status: "authorization_required",
+        authorization_url: "https://idp.example/authorize",
+        error: null,
+      };
+    });
+    const cancel = vi.fn().mockRejectedValue(new Error("cancel endpoint down"));
+
+    await expect(
+      completeMcpDashboardOAuth({
+        serverName: "reports",
+        start: async () => ({
+          flow_id: "flow-closed",
+          server_name: "reports",
+          status: "authorization_required",
+          authorization_url: "https://idp.example/authorize",
+          error: null,
+        }),
+        status,
+        cancel,
+        open: vi.fn().mockReturnValue(authWindow),
+        sleep: async () => {},
+      }),
+    ).rejects.toThrow("authorization window was closed");
+  });
+
   it("retries a transient status failure", async () => {
     const authWindow = { location: { href: "" }, opener: {}, closed: false } as unknown as Window;
     const status = vi
