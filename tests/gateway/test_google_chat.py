@@ -914,7 +914,7 @@ class TestCardClickedResolvesClarify:
         cm.register("clarify456", "session-pubsub", "Pick a demo", ["Simple", "Advanced"])
         adapter._patch_message = AsyncMock(
             return_value=type("R", (), {"success": True, "message_id": "spaces/S/messages/M.M",
-                                        "error": None})()
+                                  "error": None})()
         )
         envelope = _make_card_clicked_envelope(clarify_id="clarify456", choice="Simple")
         msg = _make_pubsub_message(envelope, attributes={"ce-type": "google.workspace.chat.message.v1.cardClicked"})
@@ -927,6 +927,105 @@ class TestCardClickedResolvesClarify:
             entry = cm._entries.get("clarify456")
         assert entry is not None and entry.event.is_set() and entry.response == "Simple"
         msg.ack.assert_called_once()
+
+
+# ===========================================================================
+# buttonClickedPayload — Workspace Add-on envelope shape (t_cd759734)
+# ===========================================================================
+
+
+def _make_button_clicked_payload_envelope(clarify_id="clarify789", choice="Simple",
+                                          message_name="spaces/S/messages/M.M"):
+    """Workspace Add-on shape per
+    https://developers.google.com/workspace/add-ons/chat/convert (Request mapping
+    by use case, "User clicks a button on a card or dialog" row): the button's
+    ``function``/``actionMethodName`` does NOT survive into this envelope
+    (CommonEventObject.invokedFunction "doesn't populate for Google Workspace
+    Add-ons that extend Google Chat") — only our own clarify_id/choice
+    parameters do, under commonEventObject.parameters."""
+    return {
+        "commonEventObject": {"parameters": {"clarify_id": clarify_id, "choice": choice}},
+        "chat": {
+            "buttonClickedPayload": {
+                "message": {"name": message_name},
+                "space": {"name": "spaces/S"},
+                "isDialogEvent": False,
+            },
+            "user": {"name": "users/12345", "displayName": "User Name"},
+        },
+    }
+
+
+class TestButtonClickedPayloadResolvesClarify:
+    """Workspace Add-on installs (User-Agent Google-gsuiteaddons) deliver button
+    clicks as chat.buttonClickedPayload, not the native CARD_CLICKED shape."""
+
+    def setup_method(self):
+        from tools import clarify_gateway as cm
+        with cm._lock:
+            cm._entries.clear()
+            cm._session_index.clear()
+            cm._notify_cbs.clear()
+
+    def test_extract_card_click_parses_button_clicked_payload(self):
+        from plugins.platforms.google_chat.adapter import GoogleChatAdapter
+
+        envelope = _make_button_clicked_payload_envelope(clarify_id="clarify789", choice="Simple")
+        extracted = GoogleChatAdapter._extract_card_click(envelope)
+        assert extracted is not None
+        clarify_id, choice, message_name, user = extracted
+        assert clarify_id == "clarify789"
+        assert choice == "Simple"
+        assert message_name == "spaces/S/messages/M.M"
+        assert user.get("displayName") == "User Name"
+
+    def test_extract_card_click_returns_none_without_clarify_params(self):
+        from plugins.platforms.google_chat.adapter import GoogleChatAdapter
+
+        envelope = {
+            "commonEventObject": {"parameters": {"some_other_key": "x"}},
+            "chat": {"buttonClickedPayload": {"message": {"name": "spaces/S/messages/M.M"}}},
+        }
+        assert GoogleChatAdapter._extract_card_click(envelope) is None
+
+    @pytest.mark.asyncio
+    async def test_dispatch_http_event_resolves_choice_via_button_clicked_payload(self, adapter):
+        from tools import clarify_gateway as cm
+
+        cm.register("clarify789", "session-addon", "Pick a demo", ["Simple", "Capability test"])
+        adapter._patch_message = AsyncMock(
+            return_value=type("R", (), {"success": True, "message_id": "spaces/S/messages/M.M",
+                                  "error": None})()
+        )
+
+        envelope = _make_button_clicked_payload_envelope(clarify_id="clarify789", choice="Simple")
+        result = await adapter.dispatch_http_event(envelope)
+
+        with cm._lock:
+            entry = cm._entries.get("clarify789")
+        assert entry is not None and entry.event.is_set() and entry.response == "Simple"
+        adapter._patch_message.assert_awaited_once()
+        # Workspace Add-on response shape: hostAppDataAction, not actionResponse.
+        assert "hostAppDataAction" in result
+
+    @pytest.mark.asyncio
+    async def test_dispatch_http_event_button_clicked_payload_other_flips_to_awaiting_text(self, adapter):
+        from tools import clarify_gateway as cm
+
+        cm.register("clarifyAddonO", "session-addon-other", "Pick", ["x", "y"])
+        adapter._patch_message = AsyncMock(
+            return_value=type("R", (), {"success": True, "message_id": "spaces/S/messages/M.M",
+                                  "error": None})()
+        )
+
+        envelope = _make_button_clicked_payload_envelope(clarify_id="clarifyAddonO", choice="__other__")
+        result = await adapter.dispatch_http_event(envelope)
+
+        pending = cm.get_pending_for_session("session-addon-other")
+        assert pending is not None and pending.awaiting_text is True
+        with cm._lock:
+            entry = cm._entries.get("clarifyAddonO")
+        assert not entry.event.is_set()
 
 
 # ===========================================================================

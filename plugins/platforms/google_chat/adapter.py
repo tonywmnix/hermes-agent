@@ -736,10 +736,37 @@ class GoogleChatAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _extract_card_click(envelope: Dict[str, Any]) -> Optional[Tuple[str, str, str, Dict[str, Any]]]:
-        """Return ``(clarify_id, choice, message_name, user)`` for a CARD_CLICKED envelope
-        carrying our ``hermes_clarify`` action (``Event.action`` = FormAction{actionMethodName,
-        parameters[]}, see https://developers.google.com/workspace/chat/api/reference/rest/v1/Event),
-        or None when the envelope isn't a CARD_CLICKED event or isn't one of our clarify buttons."""
+        """Return ``(clarify_id, choice, message_name, user)`` for a card-click envelope
+        carrying our ``hermes_clarify`` button, in either of two wire shapes, or None when
+        the envelope isn't a card click or isn't one of our clarify buttons.
+
+        Native Chat API apps (``Event``, see
+        https://developers.google.com/workspace/chat/api/reference/rest/v1/Event):
+        ``{"type": "CARD_CLICKED", "action": {"actionMethodName": ..., "parameters": [...]},
+        "message": {...}, "user": {...}}``.
+
+        Workspace Add-ons that extend Chat (``EventObject.chat.buttonClickedPayload``, see
+        https://developers.google.com/workspace/add-ons/concepts/event-objects#chat_event_object
+        and the request-mapping table at
+        https://developers.google.com/workspace/add-ons/chat/convert): the action's
+        ``function``/``actionMethodName`` is NOT delivered here (``commonEventObject
+        .invokedFunction`` "doesn't populate for Google Workspace Add-ons that extend Google
+        Chat" per the CommonEventObject reference) — only ``action.parameters`` survives, as
+        ``commonEventObject.parameters``. Our own ``clarify_id``/``choice`` keys are therefore
+        the only signal available to recognize a hermes_clarify click in this shape:
+        ``{"commonEventObject": {"parameters": {"clarify_id": ..., "choice": ...}},
+        "chat": {"buttonClickedPayload": {"message": {...}}, "user": {...}}}``."""
+        button_payload = (envelope.get("chat") or {}).get("buttonClickedPayload")
+        if button_payload is not None:
+            params = (envelope.get("commonEventObject") or {}).get("parameters") or {}
+            if not isinstance(params, dict):
+                return None
+            clarify_id, choice = params.get("clarify_id"), params.get("choice")
+            if not clarify_id or choice is None:
+                return None
+            message_name = (button_payload.get("message") or {}).get("name") or ""
+            user = (envelope.get("chat") or {}).get("user") or {}
+            return clarify_id, choice, message_name, user
         if envelope.get("type") != "CARD_CLICKED":
             return None
         action = envelope.get("action") or {}
@@ -761,8 +788,16 @@ class GoogleChatAdapter(BasePlatformAdapter):
                 "sections": [{"widgets": [{"type": "text", "text": decision_text}]}],
             })
             await self._patch_message(message_name, {"cardsV2": [card]})
-        except Exception:
-            logger.debug("[GoogleChat] Failed to patch clarify card after click", exc_info=True)
+        except Exception as exc:
+            # #t_a9a514ca: was silently swallowed at DEBUG — a REST patch failure here
+            # (e.g. Workspace Add-on identity lacking Chat API bot credentials/scope) was
+            # indistinguishable from success and could be the real cause of the red
+            # "unable to process your request" Chat renders after a clarify click. Promote
+            # to WARNING with the exception text so the next live click surfaces evidence.
+            logger.warning(
+                "[GoogleChat] Failed to patch clarify card after click for %s: %s",
+                message_name, _redact_sensitive(str(exc)),
+            )
 
     async def _handle_card_click(self, envelope: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Resolve a ``hermes_clarify`` button click against ``tools/clarify_gateway.py``.
@@ -784,6 +819,13 @@ class GoogleChatAdapter(BasePlatformAdapter):
             decision_text = f"✅ {user_label}: {choice}" if resolved else expired_text
         if message_name:
             await self._patch_clarify_message(message_name, decision_text)
+        if (envelope.get("chat") or {}).get("buttonClickedPayload") is not None:
+            # Workspace Add-on response shape (see the request/response mapping table at
+            # https://developers.google.com/workspace/add-ons/chat/convert) — no
+            # ``actionResponse``/``text`` here, the message update is expressed as a
+            # hostAppDataAction. The visible card update already happened via the REST
+            # ``_patch_clarify_message`` call above; this is best-effort confirmation.
+            return {"hostAppDataAction": {"chatDataAction": {"updateMessageAction": {"message": {"text": decision_text}}}}}
         return {"actionResponse": {"type": "UPDATE_MESSAGE"}, "text": decision_text}
 
     def _prepare_inbound(self, envelope: Dict[str, Any],
@@ -868,13 +910,35 @@ class GoogleChatAdapter(BasePlatformAdapter):
                 message.ack()
 
     async def dispatch_http_event(self, envelope: Dict[str, Any]) -> Dict[str, Any]:
-        if envelope.get("type") == "CARD_CLICKED":
+        if self._debug_raw:
+            # #t_a9a514ca: HTTP webhook mode had zero raw envelope/response logging (only
+            # the Pub/Sub path did). Mirror _on_pubsub_message's debug_raw logging here so a
+            # real click's inbound envelope AND outbound response body can be correlated
+            # against a Chat-side error in GCP Cloud Logging.
+            try:
+                from agent.redact import redact_sensitive_text
+                dump = redact_sensitive_text(json.dumps(envelope))
+            except Exception:
+                dump = "<redact filter unavailable>"
+            logger.debug("[GoogleChat] HTTP event RAW envelope (redacted): %s", dump[:2000])
+        is_card_click = envelope.get("type") == "CARD_CLICKED" or (
+            envelope.get("chat") or {}).get("buttonClickedPayload") is not None
+        if is_card_click:
             response = await self._handle_card_click(envelope)
-            return response if response is not None else {}
-        prepared = self._prepare_inbound(envelope)
-        if prepared is not None:
-            await self._dispatch_message(*prepared)
-        return {}
+            result = response if response is not None else {}
+        else:
+            prepared = self._prepare_inbound(envelope)
+            if prepared is not None:
+                await self._dispatch_message(*prepared)
+            result = {}
+        if self._debug_raw:
+            try:
+                from agent.redact import redact_sensitive_text
+                dump = redact_sensitive_text(json.dumps(result))
+            except Exception:
+                dump = "<redact filter unavailable>"
+            logger.debug("[GoogleChat] HTTP event RAW response body (redacted): %s", dump[:2000])
+        return result
 
     def verify_http_event_request(self, auth_header: str) -> Tuple[bool, str]:
         if not self._http_events_audience or not self._http_events_service_account_email:
