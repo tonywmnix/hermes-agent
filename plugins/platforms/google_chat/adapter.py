@@ -4,7 +4,8 @@ Inbound: authenticated HTTP callbacks or a Cloud Pub/Sub pull subscription. Outb
 Chat REST API (synchronous googleapiclient via ``asyncio.to_thread``). The Pub/Sub
 callback runs on a background thread, so ``handle_message`` is scheduled thread-safely
 onto the loop and never awaited there. Only MESSAGE events reach the agent; membership
-events cache the bot id, card clicks are ACK'd only.
+events cache the bot id, CARD_CLICKED events resolve pending clarify prompts
+(``tools/clarify_gateway.py``) via ``_handle_card_click``.
 """
 
 from __future__ import annotations
@@ -733,6 +734,58 @@ class GoogleChatAdapter(BasePlatformAdapter):
             return msg, space, "relay_flat"
         return None
 
+    @staticmethod
+    def _extract_card_click(envelope: Dict[str, Any]) -> Optional[Tuple[str, str, str, Dict[str, Any]]]:
+        """Return ``(clarify_id, choice, message_name, user)`` for a CARD_CLICKED envelope
+        carrying our ``hermes_clarify`` action (``Event.action`` = FormAction{actionMethodName,
+        parameters[]}, see https://developers.google.com/workspace/chat/api/reference/rest/v1/Event),
+        or None when the envelope isn't a CARD_CLICKED event or isn't one of our clarify buttons."""
+        if envelope.get("type") != "CARD_CLICKED":
+            return None
+        action = envelope.get("action") or {}
+        if action.get("actionMethodName") != "hermes_clarify":
+            return None
+        params = {p.get("key"): p.get("value") for p in (action.get("parameters") or []) if isinstance(p, dict)}
+        clarify_id, choice = params.get("clarify_id"), params.get("choice")
+        if not clarify_id or choice is None:
+            return None
+        message_name = (envelope.get("message") or {}).get("name") or ""
+        user = envelope.get("user") or {}
+        return clarify_id, choice, message_name, user
+
+    async def _patch_clarify_message(self, message_name: str, decision_text: str) -> None:
+        """Rewrite a sent clarify card to show the resolved answer without buttons."""
+        try:
+            card = card_spec_to_cards_v2({
+                "card_id": f"clarify-resolved-{message_name.split('/')[-1] or 'x'}",
+                "sections": [{"widgets": [{"type": "text", "text": decision_text}]}],
+            })
+            await self._patch_message(message_name, {"cardsV2": [card]})
+        except Exception:
+            logger.debug("[GoogleChat] Failed to patch clarify card after click", exc_info=True)
+
+    async def _handle_card_click(self, envelope: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Resolve a ``hermes_clarify`` button click against ``tools/clarify_gateway.py``.
+        Returns an ActionResponse Message body for the HTTP webhook path (None when the
+        envelope isn't one of ours). Fire-and-forget on the Pub/Sub path, whose caller
+        discards the return value and just acks."""
+        extracted = self._extract_card_click(envelope)
+        if extracted is None:
+            return None
+        clarify_id, choice, message_name, user = extracted
+        from tools import clarify_gateway as _clarify_mod
+        user_label = user.get("displayName") or user.get("name") or "user"
+        expired_text = "⏳ This prompt expired — please send a new request."
+        if choice == "__other__":
+            resolved = _clarify_mod.mark_awaiting_text(clarify_id)
+            decision_text = f"✏️ Awaiting typed answer from {user_label}…" if resolved else expired_text
+        else:
+            resolved = _clarify_mod.resolve_gateway_clarify(clarify_id, choice)
+            decision_text = f"✅ {user_label}: {choice}" if resolved else expired_text
+        if message_name:
+            await self._patch_clarify_message(message_name, decision_text)
+        return {"actionResponse": {"type": "UPDATE_MESSAGE"}, "text": decision_text}
+
     def _prepare_inbound(self, envelope: Dict[str, Any],
                          ce_type: Optional[str] = None) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
         """Extract + self-filter + dedup an inbound envelope. Returns ``(msg_with_space,
@@ -800,7 +853,10 @@ class GoogleChatAdapter(BasePlatformAdapter):
                 else:
                     logger.info("[GoogleChat] REMOVED_FROM_SPACE %s", space.get("name", "?"))
             elif "widget" in ce_type or "card" in ce_type.lower():
-                logger.info("[GoogleChat] Card/widget event ack'd (v2 feature, deferred)")
+                try:
+                    self._submit_on_loop(self._handle_card_click(envelope))
+                except Exception:
+                    logger.exception("[GoogleChat] Failed to schedule card click handling")
             else:
                 prepared = self._prepare_inbound(envelope, ce_type)
                 if prepared is not None:
@@ -812,6 +868,9 @@ class GoogleChatAdapter(BasePlatformAdapter):
                 message.ack()
 
     async def dispatch_http_event(self, envelope: Dict[str, Any]) -> Dict[str, Any]:
+        if envelope.get("type") == "CARD_CLICKED":
+            response = await self._handle_card_click(envelope)
+            return response if response is not None else {}
         prepared = self._prepare_inbound(envelope)
         if prepared is not None:
             await self._dispatch_message(*prepared)

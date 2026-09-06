@@ -828,6 +828,108 @@ class TestSend:
 
 
 # ===========================================================================
+# CARD_CLICKED — resolving a hermes_clarify button click
+# ===========================================================================
+
+
+def _make_card_clicked_envelope(clarify_id="clarify123", choice="Simple",
+                                message_name="spaces/S/messages/M.M"):
+    return {
+        "type": "CARD_CLICKED",
+        "action": {
+            "actionMethodName": "hermes_clarify",
+            "parameters": [
+                {"key": "clarify_id", "value": clarify_id},
+                {"key": "choice", "value": choice},
+            ],
+        },
+        "message": {"name": message_name},
+        "user": {"name": "users/12345", "displayName": "User Name"},
+        "space": {"name": "spaces/S"},
+    }
+
+
+class TestCardClickedResolvesClarify:
+    def setup_method(self):
+        from tools import clarify_gateway as cm
+        with cm._lock:
+            cm._entries.clear()
+            cm._session_index.clear()
+            cm._notify_cbs.clear()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_http_event_resolves_choice_and_patches_card(self, adapter):
+        from tools import clarify_gateway as cm
+
+        cm.register("clarify123", "session-key", "Pick a demo", ["Simple", "Capability test"])
+        adapter._patch_message = AsyncMock(
+            return_value=type("R", (), {"success": True, "message_id": "spaces/S/messages/M.M",
+                                        "error": None})()
+        )
+
+        envelope = _make_card_clicked_envelope(clarify_id="clarify123", choice="Simple")
+        result = await adapter.dispatch_http_event(envelope)
+
+        with cm._lock:
+            entry = cm._entries.get("clarify123")
+        assert entry is not None and entry.event.is_set() and entry.response == "Simple"
+        assert result.get("actionResponse", {}).get("type") == "UPDATE_MESSAGE"
+        adapter._patch_message.assert_awaited_once()
+        patched_body = adapter._patch_message.await_args.args[1]
+        assert "cardsV2" in patched_body
+
+    @pytest.mark.asyncio
+    async def test_dispatch_http_event_other_flips_to_awaiting_text(self, adapter):
+        from tools import clarify_gateway as cm
+
+        cm.register("clarifyO", "session-other", "Pick", ["x", "y"])
+        adapter._patch_message = AsyncMock(
+            return_value=type("R", (), {"success": True, "message_id": "spaces/S/messages/M.M",
+                                        "error": None})()
+        )
+
+        envelope = _make_card_clicked_envelope(clarify_id="clarifyO", choice="__other__")
+        result = await adapter.dispatch_http_event(envelope)
+
+        pending = cm.get_pending_for_session("session-other")
+        assert pending is not None and pending.awaiting_text is True
+        with cm._lock:
+            entry = cm._entries.get("clarifyO")
+        assert not entry.event.is_set()
+        assert "awaiting" in result.get("text", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_http_event_unknown_clarify_id_reports_expired(self, adapter):
+        adapter._patch_message = AsyncMock(
+            return_value=type("R", (), {"success": True, "message_id": "spaces/S/messages/M.M",
+                                        "error": None})()
+        )
+        envelope = _make_card_clicked_envelope(clarify_id="does-not-exist", choice="Simple")
+        result = await adapter.dispatch_http_event(envelope)
+        assert "expired" in result.get("text", "").lower()
+
+    def test_on_pubsub_message_resolves_clarify_via_card_click(self, adapter):
+        from tools import clarify_gateway as cm
+
+        cm.register("clarify456", "session-pubsub", "Pick a demo", ["Simple", "Advanced"])
+        adapter._patch_message = AsyncMock(
+            return_value=type("R", (), {"success": True, "message_id": "spaces/S/messages/M.M",
+                                        "error": None})()
+        )
+        envelope = _make_card_clicked_envelope(clarify_id="clarify456", choice="Simple")
+        msg = _make_pubsub_message(envelope, attributes={"ce-type": "google.workspace.chat.message.v1.cardClicked"})
+
+        adapter._on_pubsub_message(msg)
+        # _handle_card_click is scheduled on the loop; run it to completion.
+        adapter._loop.run_until_complete(asyncio.sleep(0))
+
+        with cm._lock:
+            entry = cm._entries.get("clarify456")
+        assert entry is not None and entry.event.is_set() and entry.response == "Simple"
+        msg.ack.assert_called_once()
+
+
+# ===========================================================================
 # send_typing / stop_typing
 # ===========================================================================
 
