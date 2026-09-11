@@ -113,7 +113,11 @@ const FIELD_COPY: Record<string, { advanced?: boolean }> = {
   QQBOT_HOME_CHANNEL: { advanced: true },
   QQBOT_HOME_CHANNEL_NAME: { advanced: true },
   WHATSAPP_ENABLED: { advanced: true },
-  WHATSAPP_MODE: { advanced: true }
+  WHATSAPP_MODE: { advanced: true },
+  GOOGLE_CHAT_HTTP_EVENTS_AUDIENCE: { advanced: true },
+  GOOGLE_CHAT_HTTP_EVENTS_SERVICE_ACCOUNT_EMAIL: { advanced: true },
+  GOOGLE_CHAT_PROJECT_ID: { advanced: true },
+  GOOGLE_CHAT_SUBSCRIPTION_NAME: { advanced: true }
 }
 
 function fieldCopy(field: MessagingEnvVarInfo, m: Translations['messaging']) {
@@ -916,6 +920,8 @@ const PLATFORM_INTRO: Record<string, string> = {
     'Run a signal-cli REST bridge somewhere reachable, then point Hermes at the URL and the registered phone number.',
   whatsapp:
     'Start the WhatsApp bridge that ships with Hermes, scan the QR code on first run, then enable the platform.',
+  google_chat:
+    'In Google Cloud Console, create a Chat app and a service account, then paste its JSON key path here (leave empty to use ADC on Cloud Run/GCE). Add an HTTP events URL or Pub/Sub subscription so Hermes receives messages.',
   bluebubbles:
     'Run BlueBubbles Server on a Mac with iMessage, expose its API, then point Hermes at the URL with the server password.',
   homeassistant:
