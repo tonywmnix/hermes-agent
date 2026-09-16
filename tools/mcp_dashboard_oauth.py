@@ -71,14 +71,12 @@ class DashboardOAuthFlow:
         return self.authorization_url
 
     def deliver_callback(
-        self,
-        *,
-        code: str | None,
-        state: str | None,
-        error: str | None,
-        iss: str | None = None,
+        self, *, code: str | None, state: str | None, error: str | None, iss: str | None = None
     ) -> None:
-        """Hand the browser redirect to the waiting flow; ``state`` must match exactly."""
+        """Hand the browser redirect to the waiting flow; ``state`` must match exactly.
+
+        ``iss`` (RFC 9207) is carried through — see ``tools.mcp_oauth._parse_redirect_query``.
+        """
         with self._lock:
             if self._callback_ready.is_set():
                 raise ValueError("OAuth callback already received")
@@ -87,20 +85,13 @@ class DashboardOAuthFlow:
             if error:
                 self._callback_error = error
             elif code:
-                # RFC 9207 `iss` — carried through so the mcp SDK's
-                # validate_authorization_response_iss() check (which rejects
-                # a missing `iss` when the AS advertises
-                # authorization_response_iss_parameter_supported) doesn't
-                # false-positive on flows that went through the dashboard
-                # callback route instead of the loopback HTTP listener.
                 self._callback = (code, state, iss)
             else:
                 self._callback_error = "OAuth callback did not include code or error"
             self._callback_ready.set()
 
     async def wait_for_callback(self, timeout: float = 300.0) -> tuple[str, str | None, str | None]:
-        ready = await asyncio.to_thread(self._callback_ready.wait, timeout)
-        if not ready:
+        if not await asyncio.to_thread(self._callback_ready.wait, timeout):
             raise TimeoutError("Timed out waiting for MCP OAuth callback")
         if self._callback_error:
             raise RuntimeError(f"OAuth authorization failed: {self._callback_error}")
